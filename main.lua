@@ -3,6 +3,7 @@ local Players = game:GetService('Players')
 local RunService = game:GetService('RunService')
 local TweenService = game:GetService('TweenService')
 local HttpService = game:GetService('HttpService')
+local JointsService = game:GetService('JointsService')
 local workspace = workspace
 
 local stamp = ReplicatedStorage:WaitForChild('BuildingBridge')
@@ -11,7 +12,6 @@ local config = ReplicatedStorage:WaitForChild('BuildingBridge')
     :WaitForChild('Config')
 local localPlayer = Players.LocalPlayer
 local playerGui = localPlayer:WaitForChild('PlayerGui')
-
 
 local SERVER_URLS = {
     'https://wtrbtoimage.com',
@@ -43,13 +43,18 @@ local function getServerCandidates(preferred)
     return candidates
 end
 
-
 local BATCH_SIZE = 50
 local BATCH_DELAY = 0.03
 local CONFIG_DELAY = 0.01
 local MAX_RETRIES = 2
 local PAUSE_INTERVAL = 15
 local PAUSE_DURATION = 3
+local ANCHOR_BLOCK_ID = 23047552
+local anchorModeEnabled = false
+local ANCHOR_OFFSETS = {
+    Vector3.new(-4, 0, 0),
+}
+local ANCHOR_TOLERANCE = 0.05
 
 local function findPlot(playerName)
     for _, area in pairs(workspace.BuildingAreas:GetChildren()) do
@@ -66,7 +71,6 @@ end
 local playerArea = findPlot(localPlayer.Name)
 local Base = playerArea and playerArea:FindFirstChild('BasePlate')
 local basePosition = Base and Base.Position or Vector3.new(0, 0, 0)
-
 
 local function safePlaceBlock(id, cframe, retries, refBlockName)
     retries = retries or MAX_RETRIES
@@ -89,10 +93,8 @@ local function safePlaceBlock(id, cframe, retries, refBlockName)
     return false, nil
 end
 
-
 local blockCache = {}
 local function findPlacedBlock(assetId, targetCFrame, cacheKey)
-
     if cacheKey and blockCache[cacheKey] then
         local cached = blockCache[cacheKey]
         if cached.Parent then
@@ -108,7 +110,6 @@ local function findPlacedBlock(assetId, targetCFrame, cacheKey)
 
     local bestBlock = nil
     local bestDist = math.huge
-
 
     for _, block in ipairs(playerArea:GetChildren()) do
         if
@@ -139,10 +140,8 @@ local function findPlacedBlock(assetId, targetCFrame, cacheKey)
     return bestBlock
 end
 
-
 local refBlockCache = {}
 local function findRefBlock(refBlockID)
-
     if refBlockCache[refBlockID] then
         local cached = refBlockCache[refBlockID]
         if cached.Parent then
@@ -155,7 +154,6 @@ local function findRefBlock(refBlockID)
     if not playerArea then
         return nil
     end
-
 
     for _, block in ipairs(playerArea:GetChildren()) do
         if block:IsA('Model') then
@@ -170,13 +168,11 @@ local function findRefBlock(refBlockID)
     return nil
 end
 
-
 local function configureBlock(block, hexColor)
     local configFolder = block:FindFirstChild('Configuration')
     if not configFolder then
         return false
     end
-
 
     local enabledValue = configFolder:FindFirstChild('Enabled')
     local hexValue = configFolder:FindFirstChild('Color (HEX)')
@@ -185,7 +181,6 @@ local function configureBlock(block, hexColor)
         warn('Missing config objects for block:', block.Name)
         return false
     end
-
 
     local success = pcall(function()
         config:InvokeServer(enabledValue, false)
@@ -196,6 +191,142 @@ local function configureBlock(block, hexColor)
     return success
 end
 
+local function waitForChildValue(instance, childName, timeout)
+    local deadline = tick() + (timeout or 2)
+    repeat
+        local child = instance:FindFirstChild(childName)
+        if child then
+            return child
+        end
+        task.wait(0.05)
+    until tick() > deadline
+    return nil
+end
+
+local function findAnchorBlockNear(targetCFrame)
+    if not playerArea then
+        return nil
+    end
+    local closest = nil
+    local bestDist = math.huge
+    for _, child in ipairs(playerArea:GetChildren()) do
+        if child:IsA('Model') then
+            local assetIdValue = child:FindFirstChild('AssetId')
+            if
+                assetIdValue
+                and assetIdValue:IsA('IntValue')
+                and assetIdValue.Value == ANCHOR_BLOCK_ID
+            then
+                local saveValue = child:FindFirstChild('SaveCFrame')
+                if saveValue then
+                    local dist = (
+                        saveValue.Value.Position - targetCFrame.Position
+                    ).Magnitude
+                    if dist < bestDist then
+                        closest = child
+                        bestDist = dist
+                    end
+                    if dist <= ANCHOR_TOLERANCE then
+                        return child
+                    end
+                end
+            end
+        end
+    end
+    return closest
+end
+
+local function isAnchorAligned(baseBlock, anchorBlock, offset)
+    if not (baseBlock and anchorBlock) then
+        return false
+    end
+    local baseSave = waitForChildValue(baseBlock, 'SaveCFrame', 2)
+    local anchorSave = waitForChildValue(anchorBlock, 'SaveCFrame', 2)
+    if not (baseSave and anchorSave) then
+        return false
+    end
+    local relative = baseSave.Value:ToObjectSpace(anchorSave.Value)
+    if math.abs(relative.X - offset.X) > ANCHOR_TOLERANCE then
+        return false
+    end
+    if math.abs(relative.Y - offset.Y) > ANCHOR_TOLERANCE then
+        return false
+    end
+    if math.abs(relative.Z - offset.Z) > ANCHOR_TOLERANCE then
+        return false
+    end
+    return true
+end
+
+local function ensureAnchorPlacement(baseBlock, anchorCFrame, offset)
+    local attempt = 0
+    while attempt < 3 do
+        attempt += 1
+        if playerArea then
+            JointsService:SetJoinAfterMoveTarget(playerArea)
+        end
+        if baseBlock then
+            JointsService:SetJoinAfterMoveInstance(baseBlock)
+        end
+        local placedAnchor = false
+        if baseBlock then
+            placedAnchor = select(
+                1,
+                safePlaceBlock(
+                    ANCHOR_BLOCK_ID,
+                    anchorCFrame,
+                    MAX_RETRIES,
+                    baseBlock.Name
+                )
+            )
+        else
+            placedAnchor = select(
+                1,
+                safePlaceBlock(ANCHOR_BLOCK_ID, anchorCFrame, MAX_RETRIES)
+            )
+        end
+        JointsService:ClearJoinAfterMoveJoints()
+        if not placedAnchor then
+            return false
+        end
+        local anchorModel = nil
+        local deadline = tick() + 2
+        repeat
+            anchorModel = findAnchorBlockNear(anchorCFrame)
+            if anchorModel then
+                break
+            end
+            task.wait(0.05)
+        until tick() > deadline
+        if anchorModel and isAnchorAligned(baseBlock, anchorModel, offset) then
+            return true
+        end
+        if anchorModel then
+            anchorModel:Destroy()
+        end
+        task.wait(0.05)
+    end
+    return false
+end
+
+local function placeAnchorsForWork(work, baseBlock, enabled)
+    if not enabled then
+        return
+    end
+    if not baseBlock then
+        return
+    end
+    for _, offset in ipairs(ANCHOR_OFFSETS) do
+        -- Use exact CFrame with -4 X offset and 90-degree rotation
+        local anchorCFrame = work.cframe
+            * CFrame.new(offset.X, offset.Y, offset.Z)
+            * CFrame.Angles(0, math.rad(90), 0)
+        local success = ensureAnchorPlacement(baseBlock, anchorCFrame, offset)
+        if not success then
+            warn('Anchor placement failed for offset', offset)
+        end
+    end
+end
 
 local topCorner = Vector3.new(1, 1, 1).Unit
 local rotAngle = math.acos(topCorner.Y)
@@ -207,11 +338,13 @@ local function placeImageFromTable(
     blockId,
     yOffset,
     xPosOffset,
-    zPosOffset
+    zPosOffset,
+    anchorMode
 )
     yOffset = yOffset or 0
     xPosOffset = xPosOffset or 5
     zPosOffset = zPosOffset or 5
+    anchorMode = anchorMode or false
 
     local blockSize = 0.5
     local spacing = 0.01
@@ -225,7 +358,6 @@ local function placeImageFromTable(
     local lastPause = tick()
     local totalPlaced = 0
     local totalFailed = 0
-
 
     local refWorkQueue = {}
     local allPixelsQueue = {}
@@ -242,24 +374,23 @@ local function placeImageFromTable(
             local cframe = CFrame.new(pos) * rotationCFrame
             local posKey = string.format('%d_%d', rowIndex, colIndex)
 
-
             if not uniqueColors[hexColor] then
                 uniqueColors[hexColor] = true
                 colorIndex = colorIndex + 1
                 colorToBlockNumber[hexColor] = colorIndex
 
                 table.insert(refWorkQueue, {
+                    position = pos,
                     cframe = cframe,
                     color = hexColor,
                     cacheKey = string.format('color_%d', colorIndex),
                     blockNumber = colorIndex,
                 })
 
-
                 refPositions[posKey] = true
             else
-
                 table.insert(allPixelsQueue, {
+                    position = pos,
                     cframe = cframe,
                     color = hexColor,
                     refBlockID = colorToBlockNumber[hexColor],
@@ -277,14 +408,12 @@ local function placeImageFromTable(
         'total pixels'
     )
 
-
     print('=== PHASE 1: Placing reference blocks ===')
     local workQueue = refWorkQueue
     local currentBatch = 1
     local totalBatches = math.ceil(#workQueue / BATCH_SIZE)
 
     while currentBatch <= totalBatches do
-
         if tick() - lastPause >= PAUSE_INTERVAL then
             print(
                 'Progress:',
@@ -302,7 +431,6 @@ local function placeImageFromTable(
         local batchStart = (currentBatch - 1) * BATCH_SIZE + 1
         local batchEnd = math.min(currentBatch * BATCH_SIZE, #workQueue)
 
-
         local batchTasks = {}
         for i = batchStart, batchEnd do
             local work = workQueue[i]
@@ -314,27 +442,36 @@ local function placeImageFromTable(
                     if placed then
                         totalPlaced = totalPlaced + 1
 
-                        task.wait(0.05)
-                        local block =
-                            findPlacedBlock(blockId, work.cframe, work.cacheKey)
-                        if block then
-                            task.spawn(function()
-                                if configureBlock(block, work.color) then
+                        -- Wait for block to appear and be ready
+                        local block = nil
+                        local maxAttempts = 20
+                        for attempt = 1, maxAttempts do
+                            task.wait(0.05)
+                            block = findPlacedBlock(blockId, work.cframe, work.cacheKey)
+                            if block then
+                                break
+                            end
+                        end
 
-                                    pcall(function()
-                                        local refID =
-                                            Instance.new('StringValue')
-                                        refID.Name = 'RefBlockID'
-                                        refID.Value = tostring(work.blockNumber)
-                                        refID.Parent = block
-                                    end)
-                                else
-                                    warn(
-                                        'Failed to configure block at',
-                                        work.cacheKey
-                                    )
-                                end
-                            end)
+                        if block then
+                            -- Configure block synchronously before placing anchors
+                            if configureBlock(block, work.color) then
+                                pcall(function()
+                                    local refID =
+                                        Instance.new('StringValue')
+                                    refID.Name = 'RefBlockID'
+                                    refID.Value = tostring(work.blockNumber)
+                                    refID.Parent = block
+                                end)
+
+                                -- Only place anchors after block is fully configured
+                                placeAnchorsForWork(work, block, anchorMode)
+                            else
+                                warn(
+                                    'Failed to configure block at',
+                                    work.cacheKey
+                                )
+                            end
                         end
                     else
                         totalFailed = totalFailed + 1
@@ -342,7 +479,6 @@ local function placeImageFromTable(
                 end)
             )
         end
-
 
         local batchTimeout = tick() + 10
         while #batchTasks > 0 and tick() < batchTimeout do
@@ -354,18 +490,15 @@ local function placeImageFromTable(
             task.wait(0.01)
         end
 
-
         for _, batchTask in ipairs(batchTasks) do
             task.cancel(batchTask)
         end
 
         currentBatch = currentBatch + 1
 
-
         if currentBatch <= totalBatches then
             task.wait(BATCH_DELAY)
         end
-
 
         if currentBatch % 10 == 0 then
             local elapsed = tick() - startTime
@@ -387,7 +520,6 @@ local function placeImageFromTable(
     print('=== Reference blocks complete! Waiting 5 seconds... ===')
     task.wait(5)
 
-
     print('=== PHASE 2: Placing remaining blocks with references ===')
     workQueue = allPixelsQueue
     currentBatch = 1
@@ -396,7 +528,6 @@ local function placeImageFromTable(
     local phase2Failed = 0
 
     while currentBatch <= totalBatches do
-
         if tick() - lastPause >= PAUSE_INTERVAL then
             print(
                 'Progress:',
@@ -414,14 +545,12 @@ local function placeImageFromTable(
         local batchStart = (currentBatch - 1) * BATCH_SIZE + 1
         local batchEnd = math.min(currentBatch * BATCH_SIZE, #workQueue)
 
-
         local batchTasks = {}
         for i = batchStart, batchEnd do
             local work = workQueue[i]
             table.insert(
                 batchTasks,
                 task.spawn(function()
-
                     local refBlock = findRefBlock(work.refBlockID)
                     if refBlock then
                         local placed, result = safePlaceBlock(
@@ -432,6 +561,26 @@ local function placeImageFromTable(
                         )
                         if placed then
                             phase2Placed = phase2Placed + 1
+
+                            -- Wait for block to appear and be ready
+                            local placedBlock = nil
+                            local maxAttempts = 20
+                            for attempt = 1, maxAttempts do
+                                task.wait(0.05)
+                                placedBlock = findPlacedBlock(
+                                    blockId,
+                                    work.cframe,
+                                    work.cacheKey
+                                )
+                                if placedBlock then
+                                    break
+                                end
+                            end
+
+                            -- Only place anchors if block was found
+                            if placedBlock then
+                                placeAnchorsForWork(work, placedBlock, anchorMode)
+                            end
                         else
                             phase2Failed = phase2Failed + 1
                         end
@@ -446,7 +595,6 @@ local function placeImageFromTable(
             )
         end
 
-
         local batchTimeout = tick() + 10
         while #batchTasks > 0 and tick() < batchTimeout do
             for i = #batchTasks, 1, -1 do
@@ -457,18 +605,15 @@ local function placeImageFromTable(
             task.wait(0.01)
         end
 
-
         for _, batchTask in ipairs(batchTasks) do
             task.cancel(batchTask)
         end
 
         currentBatch = currentBatch + 1
 
-
         if currentBatch <= totalBatches then
             task.wait(BATCH_DELAY)
         end
-
 
         if currentBatch % 10 == 0 then
             local elapsed = tick() - startTime
@@ -503,14 +648,8 @@ local function placeImageFromTable(
         'blocks/second'
     )
 
-
     blockCache = {}
 end
-
-
-
-
-
 
 local screenGui = Instance.new('ScreenGui')
 screenGui.Name = 'ImageBuilderGui'
@@ -518,10 +657,9 @@ screenGui.ResetOnSpawn = false
 screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 screenGui.Parent = playerGui
 
-
 local mainFrame = Instance.new('Frame')
 mainFrame.Name = 'MainFrame'
-mainFrame.Size = UDim2.new(0, 450, 0, 310)
+mainFrame.Size = UDim2.new(0, 450, 0, 360)
 mainFrame.Position = UDim2.new(0.5, 0, 0.5, 0)
 mainFrame.AnchorPoint = Vector2.new(0.5, 0.5)
 mainFrame.BackgroundColor3 = Color3.fromRGB(30, 30, 35)
@@ -537,7 +675,6 @@ mainStroke.Color = Color3.fromRGB(0, 0, 0)
 mainStroke.Thickness = 1
 mainStroke.Transparency = 0.5
 mainStroke.Parent = mainFrame
-
 
 local titleBar = Instance.new('Frame')
 titleBar.Name = 'TitleBar'
@@ -569,13 +706,11 @@ titleLabel.Font = Enum.Font.GothamMedium
 titleLabel.TextXAlignment = Enum.TextXAlignment.Center
 titleLabel.Parent = titleBar
 
-
 local controlsContainer = Instance.new('Frame')
 controlsContainer.Size = UDim2.new(0, 70, 0, 20)
 controlsContainer.Position = UDim2.new(0, 10, 0.5, -10)
 controlsContainer.BackgroundTransparency = 1
 controlsContainer.Parent = titleBar
-
 
 local closeButton = Instance.new('TextButton')
 closeButton.Name = 'CloseButton'
@@ -595,7 +730,6 @@ closeStroke.Color = Color3.fromRGB(200, 70, 65)
 closeStroke.Thickness = 1
 closeStroke.Parent = closeButton
 
-
 local minimizeButton = Instance.new('TextButton')
 minimizeButton.Name = 'MinimizeButton'
 minimizeButton.Size = UDim2.new(0, 14, 0, 14)
@@ -613,7 +747,6 @@ local minimizeStroke = Instance.new('UIStroke')
 minimizeStroke.Color = Color3.fromRGB(200, 150, 50)
 minimizeStroke.Thickness = 1
 minimizeStroke.Parent = minimizeButton
-
 
 local expandButton = Instance.new('TextButton')
 expandButton.Name = 'ExpandButton'
@@ -633,14 +766,12 @@ expandStroke.Color = Color3.fromRGB(30, 160, 50)
 expandStroke.Thickness = 1
 expandStroke.Parent = expandButton
 
-
 local contentContainer = Instance.new('Frame')
 contentContainer.Name = 'ContentContainer'
 contentContainer.Size = UDim2.new(1, -30, 1, -80)
 contentContainer.Position = UDim2.new(0, 15, 0, 50)
 contentContainer.BackgroundTransparency = 1
 contentContainer.Parent = mainFrame
-
 
 local imageUrlLabel = Instance.new('TextLabel')
 imageUrlLabel.Size = UDim2.new(1, 0, 0, 20)
@@ -679,7 +810,6 @@ imageUrlBox.TextXAlignment = Enum.TextXAlignment.Left
 imageUrlBox.ClearTextOnFocus = false
 imageUrlBox.Parent = imageUrlFrame
 
-
 local dimFrame = Instance.new('Frame')
 dimFrame.Size = UDim2.new(0, 80, 0, 40)
 dimFrame.Position = UDim2.new(1, -80, 0, 25)
@@ -705,7 +835,6 @@ dimBox.Font = Enum.Font.Code
 dimBox.TextXAlignment = Enum.TextXAlignment.Center
 dimBox.ClearTextOnFocus = false
 dimBox.Parent = dimFrame
-
 
 local filenameLabel = Instance.new('TextLabel')
 filenameLabel.Size = UDim2.new(1, 0, 0, 20)
@@ -744,11 +873,40 @@ filenameBox.TextXAlignment = Enum.TextXAlignment.Left
 filenameBox.ClearTextOnFocus = false
 filenameBox.Parent = filenameFrame
 
+local anchorToggle = Instance.new('TextButton')
+anchorToggle.Name = 'AnchorToggle'
+anchorToggle.Size = UDim2.new(1, 0, 0, 35)
+anchorToggle.Position = UDim2.new(0, 0, 0, 145)
+anchorToggle.BackgroundColor3 = Color3.fromRGB(60, 60, 80)
+anchorToggle.BorderSizePixel = 0
+anchorToggle.Text = 'Anchor Mode: OFF'
+anchorToggle.TextColor3 = Color3.fromRGB(255, 255, 255)
+anchorToggle.TextSize = 13
+anchorToggle.Font = Enum.Font.Gotham
+anchorToggle.Parent = contentContainer
+
+local anchorToggleCorner = Instance.new('UICorner')
+anchorToggleCorner.CornerRadius = UDim.new(0, 8)
+anchorToggleCorner.Parent = anchorToggle
+
+local anchorWarning = Instance.new('TextLabel')
+anchorWarning.Name = 'AnchorWarning'
+anchorWarning.Size = UDim2.new(1, 0, 0, 20)
+anchorWarning.Position = UDim2.new(0, 0, 0, 185)
+anchorWarning.BackgroundTransparency = 1
+anchorWarning.Text = 'Warning: Anchor mode takes about 75% longer to build'
+anchorWarning.TextColor3 = Color3.fromRGB(255, 200, 120)
+anchorWarning.TextSize = 11
+anchorWarning.Font = Enum.Font.Gotham
+anchorWarning.TextXAlignment = Enum.TextXAlignment.Left
+anchorWarning.TextWrapped = true
+anchorWarning.Visible = false
+anchorWarning.Parent = contentContainer
 
 local buildButton = Instance.new('TextButton')
 buildButton.Name = 'BuildButton'
 buildButton.Size = UDim2.new(1, 0, 0, 40)
-buildButton.Position = UDim2.new(0, 0, 0, 145)
+buildButton.Position = UDim2.new(0, 0, 0, 210)
 buildButton.BackgroundColor3 = Color3.fromRGB(155, 135, 245)
 buildButton.BorderSizePixel = 0
 buildButton.Text = 'Build Image'
@@ -761,7 +919,6 @@ local buildCorner = Instance.new('UICorner')
 buildCorner.CornerRadius = UDim.new(0, 8)
 buildCorner.Parent = buildButton
 
-
 local statusLabel = Instance.new('TextLabel')
 statusLabel.Size = UDim2.new(1, 0, 0, 20)
 statusLabel.Position = UDim2.new(0, 0, 1, -25)
@@ -772,7 +929,6 @@ statusLabel.TextSize = 11
 statusLabel.Font = Enum.Font.Gotham
 statusLabel.TextXAlignment = Enum.TextXAlignment.Center
 statusLabel.Parent = contentContainer
-
 
 local footerFrame = Instance.new('Frame')
 footerFrame.Name = 'FooterFrame'
@@ -802,6 +958,24 @@ footerLabel.Font = Enum.Font.GothamMedium
 footerLabel.TextXAlignment = Enum.TextXAlignment.Left
 footerLabel.Parent = footerFrame
 
+local function updateAnchorToggle()
+    if anchorModeEnabled then
+        anchorToggle.Text = 'Anchor Mode: ON'
+        anchorToggle.BackgroundColor3 = Color3.fromRGB(95, 75, 180)
+        anchorWarning.Visible = true
+    else
+        anchorToggle.Text = 'Anchor Mode: OFF'
+        anchorToggle.BackgroundColor3 = Color3.fromRGB(60, 60, 80)
+        anchorWarning.Visible = false
+    end
+end
+
+anchorToggle.MouseButton1Click:Connect(function()
+    anchorModeEnabled = not anchorModeEnabled
+    updateAnchorToggle()
+end)
+
+updateAnchorToggle()
 
 local dragging = false
 local dragStart = nil
@@ -833,7 +1007,6 @@ game:GetService('UserInputService').InputChanged:Connect(function(input)
     end
 end)
 
-
 local isMinimized = false
 
 local function updateButtonStates()
@@ -851,13 +1024,16 @@ closeButton.MouseButton1Click:Connect(function()
 end)
 
 minimizeButton.MouseButton1Click:Connect(function()
-    if isMinimized then return end
+    if isMinimized then
+        return
+    end
     isMinimized = true
     updateButtonStates()
 
-    local tweenInfo = TweenInfo.new(0.3, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+    local tweenInfo =
+        TweenInfo.new(0.3, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
     local tween = TweenService:Create(mainFrame, tweenInfo, {
-        Size = UDim2.new(0, 85, 0, 40)
+        Size = UDim2.new(0, 85, 0, 40),
     })
     tween:Play()
 
@@ -867,13 +1043,16 @@ minimizeButton.MouseButton1Click:Connect(function()
 end)
 
 expandButton.MouseButton1Click:Connect(function()
-    if not isMinimized then return end
+    if not isMinimized then
+        return
+    end
     isMinimized = false
     updateButtonStates()
 
-    local tweenInfo = TweenInfo.new(0.3, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+    local tweenInfo =
+        TweenInfo.new(0.3, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
     local tween = TweenService:Create(mainFrame, tweenInfo, {
-        Size = UDim2.new(0, 450, 0, 310)
+        Size = UDim2.new(0, 450, 0, 360),
     })
     tween:Play()
 
@@ -883,8 +1062,10 @@ expandButton.MouseButton1Click:Connect(function()
     titleLabel.Visible = true
 end)
 
-
-local requestFunc = request or http_request or (syn and syn.request) or (http and http.request)
+local requestFunc = request
+    or http_request
+    or (syn and syn.request)
+    or (http and http.request)
 
 local function tryApiRequest(path, options)
     options = options or {}
@@ -912,7 +1093,11 @@ local function tryApiRequest(path, options)
         end
 
         if ok and response then
-            lastError = string.format('%s request failed (status %s)', method, tostring(response.StatusCode))
+            lastError = string.format(
+                '%s request failed (status %s)',
+                method,
+                tostring(response.StatusCode)
+            )
         else
             lastError = tostring(response)
         end
@@ -943,23 +1128,22 @@ buildButton.MouseButton1Click:Connect(function()
     if not requestFunc then
         statusLabel.Text = 'Error: No HTTP request function available'
         statusLabel.TextColor3 = Color3.fromRGB(255, 100, 100)
-        warn('Executor does not support HTTP requests. Need: request, http_request, or syn.request')
+        warn(
+            'Executor does not support HTTP requests. Need: request, http_request, or syn.request'
+        )
         return
     end
 
     local imageUrl = imageUrlBox.Text
     local filename = filenameBox.Text
 
-
     local needsConversion = false
     local dataUrl = nil
 
     if imageUrl ~= '' then
-
         needsConversion = true
         dataUrl = imageUrl
     elseif filename ~= '' then
-
         needsConversion = false
         dataUrl = '/image/' .. filename
     else
@@ -968,7 +1152,8 @@ buildButton.MouseButton1Click:Connect(function()
         return
     end
 
-    statusLabel.Text = needsConversion and 'Converting image...' or 'Fetching data...'
+    statusLabel.Text = needsConversion and 'Converting image...'
+        or 'Fetching data...'
     statusLabel.TextColor3 = Color3.fromRGB(200, 200, 100)
     buildButton.Text = 'Processing...'
     buildButton.BackgroundColor3 = Color3.fromRGB(100, 100, 100)
@@ -978,16 +1163,19 @@ buildButton.MouseButton1Click:Connect(function()
         local serverBaseForFetch = lastSuccessfulServer
 
         if needsConversion then
-
             local maxDim = tonumber(dimBox.Text) or 70
 
-            local convertSuccess, convertResult, usedBase = tryApiRequest('/api/convert', {
-                Method = 'POST',
-                Headers = {
-                    ['Content-Type'] = 'application/x-www-form-urlencoded',
-                },
-                Body = 'url=' .. HttpService:UrlEncode(dataUrl) .. '&max_dim=' .. maxDim,
-            })
+            local convertSuccess, convertResult, usedBase =
+                tryApiRequest('/api/convert', {
+                    Method = 'POST',
+                    Headers = {
+                        ['Content-Type'] = 'application/x-www-form-urlencoded',
+                    },
+                    Body = 'url='
+                        .. HttpService:UrlEncode(dataUrl)
+                        .. '&max_dim='
+                        .. maxDim,
+                })
 
             if convertSuccess then
                 local responseData = HttpService:JSONDecode(convertResult.Body)
@@ -997,7 +1185,8 @@ buildButton.MouseButton1Click:Connect(function()
                     serverBaseForFetch = usedBase
                     lastSuccessfulServer = usedBase
                 else
-                    statusLabel.Text = 'Error: ' .. (responseData.error or 'Conversion failed')
+                    statusLabel.Text = 'Error: '
+                        .. (responseData.error or 'Conversion failed')
                     statusLabel.TextColor3 = Color3.fromRGB(255, 100, 100)
                     buildButton.Text = 'Build Image'
                     buildButton.BackgroundColor3 = Color3.fromRGB(155, 135, 245)
@@ -1006,7 +1195,10 @@ buildButton.MouseButton1Click:Connect(function()
             else
                 statusLabel.Text = 'Error: Failed to contact server'
                 if convertResult then
-                    statusLabel.Text = statusLabel.Text .. ' (' .. tostring(convertResult) .. ')'
+                    statusLabel.Text = statusLabel.Text
+                        .. ' ('
+                        .. tostring(convertResult)
+                        .. ')'
                 end
                 statusLabel.TextColor3 = Color3.fromRGB(255, 100, 100)
                 buildButton.Text = 'Build Image'
@@ -1014,12 +1206,11 @@ buildButton.MouseButton1Click:Connect(function()
                 return
             end
         else
-
             finalDataUrl = dataUrl
         end
 
-
-        local fetchSuccess, fetchResult, fetchBase = tryHttpGet(finalDataUrl, serverBaseForFetch)
+        local fetchSuccess, fetchResult, fetchBase =
+            tryHttpGet(finalDataUrl, serverBaseForFetch)
 
         if fetchSuccess then
             lastSuccessfulServer = fetchBase or lastSuccessfulServer
@@ -1028,13 +1219,24 @@ buildButton.MouseButton1Click:Connect(function()
             end)
 
             if parseSuccess then
-                statusLabel.Text = string.format('Building %dx%d image...', #imageData[1], #imageData)
+                statusLabel.Text = string.format(
+                    'Building %dx%d image...',
+                    #imageData[1],
+                    #imageData
+                )
                 statusLabel.TextColor3 = Color3.fromRGB(100, 255, 100)
                 buildButton.Text = 'Building...'
                 buildButton.BackgroundColor3 = Color3.fromRGB(100, 255, 100)
 
                 task.wait(0.5)
-                placeImageFromTable(imageData, 52732911, 7.2)
+                placeImageFromTable(
+                    imageData,
+                    52732911,
+                    7.2,
+                    nil,
+                    nil,
+                    anchorModeEnabled
+                )
 
                 buildButton.Text = 'Build Image'
                 buildButton.BackgroundColor3 = Color3.fromRGB(155, 135, 245)
@@ -1048,7 +1250,10 @@ buildButton.MouseButton1Click:Connect(function()
         else
             statusLabel.Text = 'Error: Failed to fetch data'
             if fetchResult then
-                statusLabel.Text = statusLabel.Text .. ' (' .. tostring(fetchResult) .. ')'
+                statusLabel.Text = statusLabel.Text
+                    .. ' ('
+                    .. tostring(fetchResult)
+                    .. ')'
             end
             statusLabel.TextColor3 = Color3.fromRGB(255, 100, 100)
             buildButton.Text = 'Build Image'
